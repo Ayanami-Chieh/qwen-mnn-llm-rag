@@ -1,0 +1,6 @@
+Flask
+requests
+numpy
+pandas
+
+# Additional dependencies can be added as needed.
