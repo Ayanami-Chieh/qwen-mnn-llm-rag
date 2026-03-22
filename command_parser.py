@@ -125,38 +125,17 @@ class CommandParser:
                 'arg_description': '<文件路径>',
                 'description': '从 TXT/MD 文件导入片段到知识库'
             },
-            'kbexport': {
-                'type': CommandType.KNOWLEDGE,  # 修改此处
-                'aliases': [],
-                'requires_args': False,
-                'arg_description': '[输出路径]',
-                'description': '导出知识库到文件（扩展名决定格式）'
-            },
-            'kbconvert': {
-                'type': CommandType.KNOWLEDGE,  # 修改此处
-                'aliases': [],
-                'requires_args': True,
-                'arg_description': '<输出路径>',
-                'description': '将知识库在 TXT 和 MD 格式之间互转'
-            },
-            'kbbackup': {
-                'type': CommandType.KNOWLEDGE,  # 修改此处
-                'aliases': [],
-                'requires_args': False,
-                'description': '手动备份当前知识库'
-            },
-            'kbrestore': {
-                'type': CommandType.KNOWLEDGE,  # 修改此处
-                'aliases': [],
-                'requires_args': False,
-                'arg_description': '[备份路径]',
-                'description': '从备份文件恢复知识库'
-            },
             'kbstats': {
-                'type': CommandType.KNOWLEDGE,  # 修改此处
+                'type': CommandType.KNOWLEDGE,
                 'aliases': [],
                 'requires_args': False,
-                'description': '查看知识库统计信息（片段数、格式等）'
+                'description': '查看知识库统计信息（片段数、缓存等）'
+            },
+            'kbclearcache': {
+                'type': CommandType.KNOWLEDGE,
+                'aliases': [],
+                'requires_args': False,
+                'description': '清除知识库向量缓存，下次操作时自动重建'
             },
         }
 
