@@ -1,7 +1,7 @@
 """
 文档管理器模块 - 支持多种文件格式的加载和处理
 支持格式：TXT, Markdown, DOCX, PDF
-分块策略：LangChain 递归分块 / 滑动窗口分块
+分块策略：递归字符分块 / 滑动窗口分块（纯 Python 实现，无需 LangChain）
 """
 import os
 import re
@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 class ChunkStrategy(Enum):
     """文本分块策略"""
-    RECURSIVE = "recursive"        # LangChain 递归字符分块
-    SLIDING_WINDOW = "sliding_window"  # 滑动窗口分块
+    RECURSIVE = "recursive"        # 递归字符分块（纯 Python）
+    SLIDING_WINDOW = "sliding_window"  # 滑动窗口分块（纯 Python）
 
 
 # ============================================================================
@@ -233,10 +233,6 @@ class DocumentManager:
         self.documents = {}       # 存储已加载的文档
         self.file_metadata = {}   # 存储文件元数据
 
-        # 初始化 LangChain 分块器（懒加载，首次使用时创建）
-        self._recursive_splitter = None
-        self._sliding_splitter = None
-
         logger.info(
             f"✅ DocumentManager 初始化完成 | 策略={strategy.value} | "
             f"chunk_size={chunk_size} | overlap={overlap}"
@@ -246,65 +242,85 @@ class DocumentManager:
     # LangChain 分块器（内部工厂）
     # ------------------------------------------------------------------
 
-    def _get_recursive_splitter(self):
+    @staticmethod
+    def _recursive_split(text: str, separators: List[str],
+                         chunk_size: int, overlap: int) -> List[str]:
         """
-        获取（或懒创建）LangChain RecursiveCharacterTextSplitter。
+        纯 Python 递归字符分块（等价于 LangChain RecursiveCharacterTextSplitter）。
 
-        分隔符优先级（中英文混合友好）：
-          段落空行 → 句号/问号/叹号 → 逗号/分号 → 空格 → 单字符兜底
+        算法：
+          1. 依次尝试 separators，找到第一个在 text 中出现的分隔符。
+          2. 用该分隔符切割，对每段递归处理（传入剩余分隔符列表）。
+          3. 将结果按 chunk_size / overlap 合并成最终块。
         """
-        if self._recursive_splitter is None:
-            try:
-                from langchain_text_splitters import RecursiveCharacterTextSplitter
-            except ImportError:
-                from langchain.text_splitter import RecursiveCharacterTextSplitter
+        # 找第一个有效分隔符
+        separator = ""
+        new_separators: List[str] = []
+        for i, sep in enumerate(separators):
+            if sep == "" or sep in text:
+                separator = sep
+                new_separators = separators[i + 1:]
+                break
 
-            self._recursive_splitter = RecursiveCharacterTextSplitter(
-                separators=[
-                    "\n\n",          # 段落
-                    "\n",            # 换行
-                    "。", "！", "？",  # 中文句末
-                    ".", "!", "?",   # 英文句末
-                    "；", "；",       # 中文分号
-                    ";",
-                    "，", ",",        # 逗号
-                    " ",             # 空格
-                    "",              # 兜底：按字符切
-                ],
-                chunk_size=self.chunk_size,
-                chunk_overlap=self.overlap,
-                length_function=len,
-                is_separator_regex=False,
-            )
-            logger.info("✅ RecursiveCharacterTextSplitter 初始化完成")
-        return self._recursive_splitter
+        # 按分隔符切割
+        if separator:
+            splits = text.split(separator)
+        else:
+            splits = list(text)
 
-    def _get_sliding_splitter(self):
+        # 对每段递归或直接收集
+        good: List[str] = []
+        for s in splits:
+            s = s.strip()
+            if not s:
+                continue
+            if len(s) <= chunk_size:
+                good.append(s)
+            else:
+                # 还需要进一步切割
+                good.extend(
+                    DocumentManager._recursive_split(
+                        s, new_separators, chunk_size, overlap
+                    )
+                )
+
+        # 合并小块，保留 overlap
+        chunks: List[str] = []
+        current = ""
+        for piece in good:
+            candidate = (current + separator + piece).strip() if current else piece
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                # overlap：从已有块的尾部取 overlap 字符作为新块起点
+                if overlap > 0 and current:
+                    tail = current[-overlap:]
+                    current = (tail + separator + piece).strip()
+                else:
+                    current = piece
+        if current:
+            chunks.append(current)
+
+        return chunks if chunks else [text[:chunk_size]]
+
+    @staticmethod
+    def _sliding_split(text: str, chunk_size: int, overlap: int) -> List[str]:
         """
-        获取（或懒创建）LangChain CharacterTextSplitter（用作滑动窗口）。
+        纯 Python 滑动窗口分块（等价于 LangChain CharacterTextSplitter(separator="")）。
 
-        CharacterTextSplitter 配合 chunk_overlap 等效于固定步长滑动窗口：
-          步长 = chunk_size - overlap
-        separator="" 表示按字符切割，不依赖分隔符。
+        步长 = chunk_size - overlap
         """
-        if self._sliding_splitter is None:
-            try:
-                from langchain_text_splitters import CharacterTextSplitter
-            except ImportError:
-                from langchain.text_splitter import CharacterTextSplitter
-
-            self._sliding_splitter = CharacterTextSplitter(
-                separator="",               # 不依赖分隔符，纯字符滑动
-                chunk_size=self.chunk_size,
-                chunk_overlap=self.overlap,
-                length_function=len,
-            )
-            step = self.chunk_size - self.overlap
-            logger.info(
-                f"✅ CharacterTextSplitter（滑动窗口）初始化完成 | "
-                f"window={self.chunk_size} | step={step}"
-            )
-        return self._sliding_splitter
+        if not text:
+            return []
+        step = max(1, chunk_size - overlap)
+        chunks = []
+        start = 0
+        while start < len(text):
+            chunks.append(text[start: start + chunk_size])
+            start += step
+        return chunks
 
     # ------------------------------------------------------------------
     # 公共分块入口
@@ -318,7 +334,8 @@ class DocumentManager:
         strategy: Optional[ChunkStrategy] = None,
     ) -> List[str]:
         """
-        将文本分块（统一入口，根据 strategy 调度到对应实现）。
+        将文本分块（统一入口，根据 strategy 调度到对应纯 Python 实现）。
+        接口与原版完全兼容，不再依赖 LangChain。
 
         Args:
             text:       输入文本
@@ -332,51 +349,26 @@ class DocumentManager:
         if not text:
             return []
 
-        # 若调用时临时指定了不同的参数，则新建临时分块器
         use_strategy = strategy or self.strategy
         use_size = chunk_size or self.chunk_size
         use_overlap = overlap if overlap is not None else self.overlap
 
-        # 参数与实例一致时直接复用缓存的分块器
-        same_params = (use_size == self.chunk_size and use_overlap == self.overlap)
-
         if use_strategy == ChunkStrategy.RECURSIVE:
-            if same_params:
-                splitter = self._get_recursive_splitter()
-            else:
-                try:
-                    from langchain_text_splitters import RecursiveCharacterTextSplitter
-                except ImportError:
-                    from langchain.text_splitter import RecursiveCharacterTextSplitter
-                splitter = RecursiveCharacterTextSplitter(
-                    separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?",
-                                "；", ";", "，", ",", " ", ""],
-                    chunk_size=use_size,
-                    chunk_overlap=use_overlap,
-                    length_function=len,
-                    is_separator_regex=False,
-                )
-            chunks = splitter.split_text(text)
+            separators = [
+                "\n\n", "\n",
+                "。", "！", "？", ".", "!", "?",
+                "；", ";", "，", ",", " ", "",
+            ]
+            chunks = self._recursive_split(text, separators, use_size, use_overlap)
 
         elif use_strategy == ChunkStrategy.SLIDING_WINDOW:
-            if same_params:
-                splitter = self._get_sliding_splitter()
-            else:
-                try:
-                    from langchain_text_splitters import CharacterTextSplitter
-                except ImportError:
-                    from langchain.text_splitter import CharacterTextSplitter
-                splitter = CharacterTextSplitter(
-                    separator="",
-                    chunk_size=use_size,
-                    chunk_overlap=use_overlap,
-                    length_function=len,
-                )
-            chunks = splitter.split_text(text)
+            chunks = self._sliding_split(text, use_size, use_overlap)
 
         else:
             logger.warning(f"未知分块策略 {use_strategy}，回退到递归分块")
-            chunks = self._get_recursive_splitter().split_text(text)
+            separators = ["\n\n", "\n", "。", "！", "？", ".", "!", "?",
+                          "；", ";", "，", ",", " ", ""]
+            chunks = self._recursive_split(text, separators, use_size, use_overlap)
 
         logger.debug(
             f"chunk_text | strategy={use_strategy.value} | "
@@ -613,10 +605,6 @@ class DocumentManager:
             self.chunk_size = chunk_size
         if overlap is not None:
             self.overlap = overlap
-
-        # 重置缓存的分块器
-        self._recursive_splitter = None
-        self._sliding_splitter = None
 
         logger.info(
             f"✅ 分块策略已切换 | strategy={strategy.value} | "
