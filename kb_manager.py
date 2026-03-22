@@ -18,14 +18,17 @@ logger = logging.getLogger(__name__)
 class KBManager:
     """知识库管理器 - 支持对知识库片段的增删改查"""
 
-    def __init__(self, kb_path: str):
+    def __init__(self, kb_path: str, chunk_fn=None):
         """
         初始化知识库管理器
 
         Args:
-            kb_path: 知识库文件路径（.txt）
+            kb_path:  知识库文件路径（.txt）
+            chunk_fn: 文本分块函数（传入 document_manager.chunk_text），
+                      为 None 时退化为按句号硬切（兼容旧行为）
         """
         self.kb_path = kb_path
+        self.chunk_fn = chunk_fn
         self.backup_dir = str(Path(kb_path).parent / "kb_backups")
         os.makedirs(self.backup_dir, exist_ok=True)
         logger.info(f"✅ KBManager 初始化完成 | 路径={kb_path}")
@@ -45,9 +48,14 @@ class KBManager:
             f.write(content)
 
     def _parse_fragments(self, raw: str) -> List[str]:
-        """将原始文本解析为片段列表（按句号分割，与 demo0 保持一致）"""
-        fragments = [frag.strip() + '。' for frag in raw.split('。') if frag.strip()]
-        return fragments
+        """将原始文本解析为片段列表。
+        若传入了 chunk_fn 则使用与主系统一致的分块逻辑；
+        否则退化为按句号硬切（兼容旧行为）。
+        """
+        if self.chunk_fn is not None:
+            return self.chunk_fn(raw)
+        # 兼容旧行为
+        return [frag.strip() + '。' for frag in raw.split('。') if frag.strip()]
 
     def _fragments_to_raw(self, fragments: List[str]) -> str:
         """将片段列表还原为原始文本（去掉末尾句号后用句号拼接）"""
@@ -334,74 +342,6 @@ class KBManager:
 
     # ------------------------------------------------------------------
     # 导出
-    # ------------------------------------------------------------------
-
-    def export_to_file(self, output_path: str) -> Tuple[bool, str]:
-        """
-        将知识库导出为每行一条的 TXT 文件
-
-        Args:
-            output_path: 导出路径
-
-        Returns:
-            (是否成功, 提示信息)
-        """
-        try:
-            raw = self._read_raw()
-            fragments = self._parse_fragments(raw)
-
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for frag in fragments:
-                    f.write(frag + '\n')
-
-            msg = f"已导出 {len(fragments)} 条片段到: {output_path}"
-            logger.info(f"✅ {msg}")
-            return True, msg
-        except Exception as e:
-            logger.error(f"❌ 导出失败: {e}")
-            return False, f"导出失败: {e}"
-
-    # ------------------------------------------------------------------
-    # 备份恢复
-    # ------------------------------------------------------------------
-
-    def list_backups(self) -> List[str]:
-        """列出所有备份文件"""
-        backups = sorted(Path(self.backup_dir).glob("kb_backup_*.txt"), reverse=True)
-        return [str(b) for b in backups]
-
-    def restore_backup(self, backup_path: str) -> Tuple[bool, str]:
-        """
-        从备份文件恢复知识库
-
-        Args:
-            backup_path: 备份文件路径
-
-        Returns:
-            (是否成功, 提示信息)
-        """
-        if not os.path.exists(backup_path):
-            return False, f"备份文件不存在: {backup_path}"
-
-        try:
-            # 先备份当前版本再恢复
-            self._backup()
-            with open(backup_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            self._write_raw(content)
-
-            fragments = self._parse_fragments(content)
-            msg = f"已从备份恢复，共 {len(fragments)} 条片段"
-            logger.info(f"✅ {msg}")
-            return True, msg
-        except Exception as e:
-            logger.error(f"❌ 恢复失败: {e}")
-            return False, f"恢复失败: {e}"
-
-    # ------------------------------------------------------------------
-    # 统计
-    # ------------------------------------------------------------------
-
     def get_stats(self) -> Dict:
         """获取知识库统计信息"""
         raw = self._read_raw()
@@ -411,5 +351,4 @@ class KBManager:
             'total_chars': len(raw),
             'avg_fragment_len': round(sum(len(f) for f in fragments) / max(len(fragments), 1), 1),
             'kb_path': self.kb_path,
-            'backup_count': len(self.list_backups()),
         }
