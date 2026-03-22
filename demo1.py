@@ -6,7 +6,7 @@
 - 智能命令解析和验证
 - 会话级向量缓存（系统退出时清除）
 - 向量索引和缓存持久化
-- 知识库增删改查（kbadd / kbdel / kbupdate / kbsearch / kbimport / kbexport / kbrestore）
+- 知识库增删改查（kbadd / kbdel / kbupdate / kbsearch / kbimport / kbclearcache）
 """
 import os
 import sys
@@ -52,7 +52,7 @@ class RAGSystem:
         self.config = {
             'llm_config': r"D:\MNN_RAG_Project\src\model\llm_config.json",
             'bge_model': r"D:\MNN_RAG_Project\models\bge-m3",
-            'knowledge_base': r"D:\MNN_RAG_Project\src\KB_demo.txt",
+            'knowledge_base': r"D:\MNN_RAG_Project\src\ip6.md",
             'documents_dir': r"D:\MNN_RAG_Project\documents",
         }
 
@@ -66,7 +66,7 @@ class RAGSystem:
         self.persistence = PersistenceManager()
 
         # ⭐ 知识库管理器
-        self.kb_manager = KBManager(self.config['knowledge_base'])
+        self.kb_manager = KBManager(self.config['knowledge_base'], chunk_fn=self.document_manager.chunk_text)
 
         # 初始化变量
         self.llm_model = None
@@ -163,8 +163,7 @@ class RAGSystem:
             with open(self.config['knowledge_base'], 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            fragments = [frag.strip() for frag in content.split('。') if frag.strip()]
-            self.base_knowledge_fragments = [frag + '。' for frag in fragments]
+            self.base_knowledge_fragments = self.document_manager.chunk_text(content)
             self.knowledge_fragments = self.base_knowledge_fragments.copy()
 
             print(f"     已加载 {len(self.knowledge_fragments)} 个知识片段")
@@ -399,18 +398,11 @@ class RAGSystem:
             file_path = args[0] if args else ''
             self._kb_import(file_path)
 
-        elif cmd == 'kbexport':
-            output_path = args[0] if args else ''
-            self._kb_export(output_path)
-
-        elif cmd == 'kbbackup':
-            self._kb_backup()
-
-        elif cmd == 'kbrestore':
-            self._kb_restore(args)
-
         elif cmd == 'kbstats':
             self._kb_stats()
+
+        elif cmd == 'kbclearcache':
+            self._kb_clear_cache()
 
         else:
             suggestion = self.command_validator.suggest_command(cmd)
@@ -580,62 +572,6 @@ class RAGSystem:
         else:
             print(f"❌ {msg}")
 
-    def _kb_export(self, output_path: str):
-        """将知识库导出为 TXT 文件"""
-        if not output_path:
-            # 默认导出路径
-            output_path = str(
-                os.path.join(os.path.dirname(self.config['knowledge_base']),
-                             f"kb_export_{time.strftime('%Y%m%d_%H%M%S')}.txt")
-            )
-
-        success, msg = self.kb_manager.export_to_file(output_path)
-        if success:
-            print(f"✅ {msg}")
-        else:
-            print(f"❌ {msg}")
-
-    def _kb_backup(self):
-        """手动备份知识库"""
-        try:
-            backup_path = self.kb_manager._backup()
-            print(f"✅ 备份成功: {backup_path}")
-        except Exception as e:
-            print(f"❌ 备份失败: {e}")
-
-    def _kb_restore(self, args: list):
-        """从备份恢复知识库"""
-        backups = self.kb_manager.list_backups()
-
-        if not backups:
-            print("  暂无备份文件")
-            return
-
-        if not args:
-            # 显示备份列表供选择
-            print("\n📋 可用备份:")
-            for i, b in enumerate(backups):
-                print(f"  [{i}] {os.path.basename(b)}")
-            choice = input("\n请输入备份序号: ").strip()
-            if not choice.isdigit() or int(choice) >= len(backups):
-                print("❌ 无效序号")
-                return
-            backup_path = backups[int(choice)]
-        else:
-            backup_path = args[0]
-
-        confirm = input(f"\n⚠️  将用备份覆盖当前知识库，确认？(输入 yes 确认): ").strip().lower()
-        if confirm != 'yes':
-            print("  已取消")
-            return
-
-        success, msg = self.kb_manager.restore_backup(backup_path)
-        if success:
-            print(f"✅ {msg}")
-            self._reload_kb_and_rebuild()
-        else:
-            print(f"❌ {msg}")
-
     def _kb_stats(self):
         """显示知识库统计信息"""
         stats = self.kb_manager.get_stats()
@@ -643,8 +579,32 @@ class RAGSystem:
         print(f"  - 总片段数:    {stats['total_fragments']}")
         print(f"  - 总字符数:    {stats['total_chars']}")
         print(f"  - 平均片段长度: {stats['avg_fragment_len']} 字符")
-        print(f"  - 备份数量:    {stats['backup_count']}")
         print(f"  - 文件路径:    {stats['kb_path']}")
+        cache_valid = self.persistence.is_cache_valid()
+        print(f"  - 向量缓存:    {'✅ 有效' if cache_valid else '❌ 无缓存'}")
+        if cache_valid:
+            info = self.persistence.get_cache_info()
+            print(f"  - 缓存大小:    {info['total_size_mb']:.2f} MB")
+        print()
+
+    def _kb_clear_cache(self):
+        """清除知识库向量缓存，下次重建时会重新计算"""
+        print("\n🗑️  准备清除向量缓存...")
+        if not self.persistence.is_cache_valid():
+            print("   当前无有效缓存，无需清除")
+            return
+        info = self.persistence.get_cache_info()
+        print(f"   缓存大小: {info['total_size_mb']:.2f} MB")
+        confirm = input("   确认清除？(输入 yes 确认): ").strip().lower()
+        if confirm != 'yes':
+            print("   已取消")
+            return
+        success = self.persistence.clear_cache()
+        if success:
+            print("✅ 向量缓存已清除")
+            print("   下次操作或重启时将自动重建缓存")
+        else:
+            print("❌ 清除失败，请手动删除缓存目录下的文件")
         print()
 
     # ------------------------------------------------------------------
@@ -663,7 +623,7 @@ class RAGSystem:
                 content = f.read()
 
             fragments = [frag.strip() for frag in content.split('。') if frag.strip()]
-            self.base_knowledge_fragments = [frag + '。' for frag in fragments]
+            self.base_knowledge_fragments = self.document_manager.chunk_text(content)
 
             # 如果有已加载的文档，保留文档片段
             if self.has_loaded_documents:
