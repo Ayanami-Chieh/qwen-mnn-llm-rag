@@ -6,9 +6,10 @@
 - 智能命令解析和验证
 - 会话级向量缓存（系统退出时清除）
 - 向量索引和缓存持久化
-- 知识库增删改查（kbadd / kbdel / kbupdate / kbsearch / kbimport / kbexport / kbrestore）
+- 知识库增删改查（kbadd / kbdel / kbupdate / kbsearch / kbimport / kbclearcache）
 """
 import os
+import re
 import sys
 import time
 import json
@@ -50,9 +51,9 @@ class RAGSystem:
         """初始化系统"""
         # 配置路径
         self.config = {
-            'llm_config': r"D:\MNN_RAG_Project\src\model\llm_config.json",
+            'llm_config': r"D:\MNN_RAG_Project\mnn_model\model\config.json",
             'bge_model': r"D:\MNN_RAG_Project\models\bge-m3",
-            'knowledge_base': r"D:\MNN_RAG_Project\src\KB_demo.txt",
+            'knowledge_base': r"D:\MNN_RAG_Project\src\ipl6.md",
             'documents_dir': r"D:\MNN_RAG_Project\documents",
         }
 
@@ -66,23 +67,54 @@ class RAGSystem:
         self.persistence = PersistenceManager()
 
         # ⭐ 知识库管理器
-        self.kb_manager = KBManager(self.config['knowledge_base'])
+        self.kb_manager = KBManager(self.config['knowledge_base'], chunk_fn=self.document_manager.chunk_text)
 
         # 初始化变量
         self.llm_model = None
         self.embedder = None
 
         # ⭐ 核心数据结构
-        self.base_knowledge_fragments = []  # 原始知识库（不变）
-        self.knowledge_fragments = []       # 当前知识库（包含文档）
-        self.fragment_embeddings = None     # 当前向量
-        self.faiss_index = None             # Faiss索引
+        # base_knowledge_fragments: 只存知识库原始片段，永远不被文档内容污染
+        # knowledge_fragments:      实际检索用 = 知识库片段 + 带标签的文档片段
+        self.base_knowledge_fragments = []
+        self.knowledge_fragments = []
+        self.fragment_embeddings = None
+        self.faiss_index = None
 
         # ⭐ 会话状态标记
-        self.has_loaded_documents = False   # 是否加载过文档
+        self.has_loaded_documents = False
 
         # 启动系统
         self.startup()
+
+    # ------------------------------------------------------------------
+    # 文档片段打标签（统一入口）
+    # ------------------------------------------------------------------
+
+    def _build_tagged_doc_chunks(self) -> List[str]:
+        """
+        将所有已加载文档的片段打上来源文件名标签。
+        同时在每个文档前插入一条索引片段，使"上传了什么/有哪些文档"类问题也能被检索到。
+        只写入 knowledge_fragments，不触碰 base_knowledge_fragments，隔离完全安全。
+        """
+        result = []
+        for doc_name, paragraphs in self.document_manager.documents.items():
+            meta = self.document_manager.file_metadata.get(doc_name, {})
+            filename = os.path.basename(meta.get('path', doc_name))
+            chunks = self.document_manager.chunk_text("\n".join(paragraphs))
+            total_chars = sum(len(p) for p in paragraphs)
+            # 索引片段
+            result.append(
+                f"[来源文件:{filename}] 用户已加载文档：{filename}，"
+                f"共 {len(paragraphs)} 段，{total_chars} 个字符。"
+            )
+            # 内容片段
+            result.extend([f"[来源文件:{filename}] {chunk}" for chunk in chunks])
+        return result
+
+    # ------------------------------------------------------------------
+    # 启动流程
+    # ------------------------------------------------------------------
 
     def startup(self):
         """启动系统"""
@@ -163,8 +195,7 @@ class RAGSystem:
             with open(self.config['knowledge_base'], 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            fragments = [frag.strip() for frag in content.split('。') if frag.strip()]
-            self.base_knowledge_fragments = [frag + '。' for frag in fragments]
+            self.base_knowledge_fragments = self.document_manager.chunk_text(content)
             self.knowledge_fragments = self.base_knowledge_fragments.copy()
 
             print(f"     已加载 {len(self.knowledge_fragments)} 个知识片段")
@@ -268,7 +299,24 @@ class RAGSystem:
 
     def generate_response(self, query: str) -> Tuple[str, List[str]]:
         """生成响应"""
-        relevant_fragments = self.retrieve_relevant_fragments(query, top_k=3)
+        # 修复: 检测问题中是否包含文件名，优先精确匹配该文件的所有片段
+        filename_hit = re.search(
+            r'[\w\u4e00-\u9fa5\-]+\.(txt|md|pdf|docx)', query, re.IGNORECASE
+        )
+        if filename_hit:
+            fname = filename_hit.group(0)
+            file_frags = [f for f in self.knowledge_fragments if f"[来源文件:{fname}]" in f]
+            if file_frags:
+                relevant_fragments = file_frags[:9]  # 最多取9条覆盖文件内容
+            else:
+                relevant_fragments = self.retrieve_relevant_fragments(query, top_k=3)
+        else:
+            relevant_fragments = self.retrieve_relevant_fragments(query, top_k=3)
+
+        # 修复: 检索为空时直接返回提示，不把空 context 送给模型造成胡乱回答
+        if not relevant_fragments:
+            return "未能在知识库中检索到相关内容，请确认文档已正确加载，或换一种提问方式。", []
+
         context = "\n".join([f"- {frag}" for frag in relevant_fragments])
         prompt = f"""根据以下知识库信息回答问题：
 
@@ -346,7 +394,6 @@ class RAGSystem:
 
     def _execute_command(self, cmd: str, args: list):
         """执行命令"""
-        # ── 原有命令 ──────────────────────────────────────────────────
         if cmd == 'help':
             self._show_help()
 
@@ -377,7 +424,6 @@ class RAGSystem:
         elif cmd == 'docs':
             self._show_document_stats()
 
-        # ── 知识库管理命令 ────────────────────────────────────────────
         elif cmd == 'kblist':
             self._kb_list(args)
 
@@ -399,18 +445,11 @@ class RAGSystem:
             file_path = args[0] if args else ''
             self._kb_import(file_path)
 
-        elif cmd == 'kbexport':
-            output_path = args[0] if args else ''
-            self._kb_export(output_path)
-
-        elif cmd == 'kbbackup':
-            self._kb_backup()
-
-        elif cmd == 'kbrestore':
-            self._kb_restore(args)
-
         elif cmd == 'kbstats':
             self._kb_stats()
+
+        elif cmd == 'kbclearcache':
+            self._kb_clear_cache()
 
         else:
             suggestion = self.command_validator.suggest_command(cmd)
@@ -427,7 +466,6 @@ class RAGSystem:
 
     def _kb_list(self, args: list):
         """列出知识库片段（支持分页和关键字过滤）"""
-        # 用法: kblist [page] [keyword]
         page = 1
         keyword = None
 
@@ -463,7 +501,7 @@ class RAGSystem:
         print("-" * 70)
         if not results:
             print("  (无结果)")
-        for idx, frag in results[:30]:  # 最多显示30条
+        for idx, frag in results[:30]:
             snippet = frag[:70] + '...' if len(frag) > 70 else frag
             print(f"  [{idx:>4}] {snippet}")
         if len(results) > 30:
@@ -493,13 +531,11 @@ class RAGSystem:
             return
 
         if args[0] == 'keyword':
-            # 按关键字删除
             keyword = ' '.join(args[1:]) if len(args) > 1 else ''
             if not keyword:
                 print("❌ 请提供关键字，例: kbdel keyword 北京")
                 return
 
-            # 先搜索确认
             results = self.kb_manager.search_fragments(keyword)
             if not results:
                 print(f"  没有找到包含 '{keyword}' 的片段")
@@ -524,7 +560,6 @@ class RAGSystem:
                 print(f"❌ {msg}")
 
         elif args[0].isdigit():
-            # 按序号删除
             index = int(args[0])
             items, _ = self.kb_manager.list_fragments(page=1, page_size=99999)
             target = next((f for i, f in items if i == index), None)
@@ -547,7 +582,6 @@ class RAGSystem:
 
     def _kb_update(self, args: list):
         """更新知识库某条片段"""
-        # 用法: kbupdate <序号> <新内容>
         if len(args) < 2 or not args[0].isdigit():
             print("❌ 用法: kbupdate <序号> <新内容>")
             print("   例:  kbupdate 3 北京是中华人民共和国的首都")
@@ -580,62 +614,6 @@ class RAGSystem:
         else:
             print(f"❌ {msg}")
 
-    def _kb_export(self, output_path: str):
-        """将知识库导出为 TXT 文件"""
-        if not output_path:
-            # 默认导出路径
-            output_path = str(
-                os.path.join(os.path.dirname(self.config['knowledge_base']),
-                             f"kb_export_{time.strftime('%Y%m%d_%H%M%S')}.txt")
-            )
-
-        success, msg = self.kb_manager.export_to_file(output_path)
-        if success:
-            print(f"✅ {msg}")
-        else:
-            print(f"❌ {msg}")
-
-    def _kb_backup(self):
-        """手动备份知识库"""
-        try:
-            backup_path = self.kb_manager._backup()
-            print(f"✅ 备份成功: {backup_path}")
-        except Exception as e:
-            print(f"❌ 备份失败: {e}")
-
-    def _kb_restore(self, args: list):
-        """从备份恢复知识库"""
-        backups = self.kb_manager.list_backups()
-
-        if not backups:
-            print("  暂无备份文件")
-            return
-
-        if not args:
-            # 显示备份列表供选择
-            print("\n📋 可用备份:")
-            for i, b in enumerate(backups):
-                print(f"  [{i}] {os.path.basename(b)}")
-            choice = input("\n请输入备份序号: ").strip()
-            if not choice.isdigit() or int(choice) >= len(backups):
-                print("❌ 无效序号")
-                return
-            backup_path = backups[int(choice)]
-        else:
-            backup_path = args[0]
-
-        confirm = input(f"\n⚠️  将用备份覆盖当前知识库，确认？(输入 yes 确认): ").strip().lower()
-        if confirm != 'yes':
-            print("  已取消")
-            return
-
-        success, msg = self.kb_manager.restore_backup(backup_path)
-        if success:
-            print(f"✅ {msg}")
-            self._reload_kb_and_rebuild()
-        else:
-            print(f"❌ {msg}")
-
     def _kb_stats(self):
         """显示知识库统计信息"""
         stats = self.kb_manager.get_stats()
@@ -643,8 +621,32 @@ class RAGSystem:
         print(f"  - 总片段数:    {stats['total_fragments']}")
         print(f"  - 总字符数:    {stats['total_chars']}")
         print(f"  - 平均片段长度: {stats['avg_fragment_len']} 字符")
-        print(f"  - 备份数量:    {stats['backup_count']}")
         print(f"  - 文件路径:    {stats['kb_path']}")
+        cache_valid = self.persistence.is_cache_valid()
+        print(f"  - 向量缓存:    {'✅ 有效' if cache_valid else '❌ 无缓存'}")
+        if cache_valid:
+            info = self.persistence.get_cache_info()
+            print(f"  - 缓存大小:    {info['total_size_mb']:.2f} MB")
+        print()
+
+    def _kb_clear_cache(self):
+        """清除知识库向量缓存，下次重建时会重新计算"""
+        print("\n🗑️  准备清除向量缓存...")
+        if not self.persistence.is_cache_valid():
+            print("   当前无有效缓存，无需清除")
+            return
+        info = self.persistence.get_cache_info()
+        print(f"   缓存大小: {info['total_size_mb']:.2f} MB")
+        confirm = input("   确认清除？(输入 yes 确认): ").strip().lower()
+        if confirm != 'yes':
+            print("   已取消")
+            return
+        success = self.persistence.clear_cache()
+        if success:
+            print("✅ 向量缓存已清除")
+            print("   下次操作或重启时将自动重建缓存")
+        else:
+            print("❌ 清除失败，请手动删除缓存目录下的文件")
         print()
 
     # ------------------------------------------------------------------
@@ -654,7 +656,8 @@ class RAGSystem:
     def _reload_kb_and_rebuild(self):
         """
         知识库文件发生变更后，重新读取片段并重建向量索引。
-        同时清除磁盘缓存，保证下次启动使用最新数据。
+        base_knowledge_fragments 只存知识库原始内容；
+        文档片段通过 _build_tagged_doc_chunks() 追加，两者始终隔离。
         """
         print("\n🔄 正在重新加载知识库并重建索引...")
 
@@ -662,16 +665,12 @@ class RAGSystem:
             with open(self.config['knowledge_base'], 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            fragments = [frag.strip() for frag in content.split('。') if frag.strip()]
-            self.base_knowledge_fragments = [frag + '。' for frag in fragments]
+            self.base_knowledge_fragments = self.document_manager.chunk_text(content)
+            self.knowledge_fragments = self.base_knowledge_fragments.copy()
 
-            # 如果有已加载的文档，保留文档片段
+            # 修复: 重建时使用打标签的文档片段，保持标签一致性
             if self.has_loaded_documents:
-                doc_chunks = self.document_manager.process_documents()
-                self.knowledge_fragments = self.base_knowledge_fragments.copy()
-                self.knowledge_fragments.extend(doc_chunks)
-            else:
-                self.knowledge_fragments = self.base_knowledge_fragments.copy()
+                self.knowledge_fragments.extend(self._build_tagged_doc_chunks())
 
             print(f"   片段数: {len(self.knowledge_fragments)}")
             print("   正在重新计算向量...")
@@ -685,12 +684,10 @@ class RAGSystem:
             embed_time = time.time() - start_time
             print(f"   ✅ 向量计算完成 ({embed_time:.2f}s)")
 
-            # 清除旧缓存，写入新缓存
             self.persistence.clear_cache()
             self.persistence.save_embeddings(self.fragment_embeddings)
             self.persistence.save_fragments(self.knowledge_fragments)
 
-            # 重建 Faiss 索引
             self.build_faiss_index()
             print("   ✅ 知识库已更新完毕\n")
 
@@ -791,16 +788,23 @@ class RAGSystem:
         print()
 
     def _rebuild_knowledge_base(self):
-        """使用文档重建知识库"""
+        """
+        加载文档后重建知识库。
+        base_knowledge_fragments 只存知识库原始内容，不受影响；
+        文档片段带文件名标签追加到 knowledge_fragments。
+        """
         print("\n🔄 重建知识库...")
 
         self.knowledge_fragments = self.base_knowledge_fragments.copy()
-        doc_chunks = self.document_manager.process_documents()
 
-        if doc_chunks:
-            self.knowledge_fragments.extend(doc_chunks)
+        # 修复: 使用统一的打标签函数
+        tagged_doc_chunks = self._build_tagged_doc_chunks()
+        if tagged_doc_chunks:
+            self.knowledge_fragments.extend(tagged_doc_chunks)
+            # 计算纯内容片段数（去掉索引片段）
+            content_chunks = [c for c in tagged_doc_chunks if "用户已加载文档" not in c]
             print(f"   包含原始知识库片段: {len(self.base_knowledge_fragments)}")
-            print(f"   包含文档片段: {len(doc_chunks)}")
+            print(f"   包含文档内容片段: {len(content_chunks)}")
             print(f"   总计片段数: {len(self.knowledge_fragments)}")
 
         print(f"   正在计算向量 ({len(self.knowledge_fragments)} 个片段)...")
@@ -831,7 +835,10 @@ class RAGSystem:
         print(f"\n💡 使用 'kblist' 可分页浏览并管理知识库\n")
 
     def _cleanup_on_exit(self):
-        """系统退出时的清理逻辑"""
+        """
+        系统退出时的清理逻辑。
+        清除文档后还原为纯知识库片段，base_knowledge_fragments 完全不受影响。
+        """
         print("\n🧹 正在清理...")
 
         if self.has_loaded_documents:
@@ -839,6 +846,7 @@ class RAGSystem:
             self.document_manager.clear_documents()
             self.has_loaded_documents = False
 
+            # 直接用 base 还原，知识库向量不受影响
             self.knowledge_fragments = self.base_knowledge_fragments.copy()
             self.fragment_embeddings = self.embedder.encode(
                 self.knowledge_fragments,
